@@ -30,22 +30,22 @@
 
 #define SCREEN_W   144
 #define SCREEN_H   168
-#define SKY_H      108
+#define SKY_H      116   /* sky canvas height — scene (72px) sits at bottom, 44px open sky above */
 #define STRIP_Y    SKY_H
 
 /* Clock — bottom right */
 #define CLOCK_X    88
-#define CLOCK_Y    (STRIP_Y + 3)
-#define CLOCK_SIZE 54
-#define CLOCK_CX   27
-#define CLOCK_CY   27
-#define CLOCK_R    23
+#define CLOCK_Y    (STRIP_Y + 2)
+#define CLOCK_SIZE 52
+#define CLOCK_CX   26
+#define CLOCK_CY   26
+#define CLOCK_R    22
 #define PX_STEP    3
 #define PX_SZ      2
 
 /* Health widgets — bottom left */
 #define WIDGET_X   3
-#define WIDGET_Y   (STRIP_Y + 4)
+#define WIDGET_Y   (STRIP_Y + 3)
 
 /* Sun/moon pixel size */
 #define SP         2
@@ -67,12 +67,17 @@
 #define PERSIST_WIDGET0    2
 #define PERSIST_WIDGET1    3
 #define PERSIST_WIDGET2    4
+#define PERSIST_SUNRISE    5   /* minutes since midnight */
+#define PERSIST_SUNSET     6   /* minutes since midnight */
 
-/* AppMessage */
+/* AppMessage keys (Automatic, alphabetical order):
+ *   clockstyle=0  sunrise=1  sunset=2  widget0=3  widget1=4  widget2=5  */
 #define MSG_CLOCKSTYLE 0
-#define MSG_WIDGET0    1
-#define MSG_WIDGET1    2
-#define MSG_WIDGET2    3
+#define MSG_SUNRISE    1
+#define MSG_SUNSET     2
+#define MSG_WIDGET0    3
+#define MSG_WIDGET1    4
+#define MSG_WIDGET2    5
 
 /* ================================================================ */
 /*  TUSCANY SCENE — 72x36 grid at SP=2px each pixel                */
@@ -151,11 +156,15 @@ static const int16_t TUSCANY[][2] = {
 static Window     *s_window;
 static Layer      *s_canvas_layer;
 static Layer      *s_clock_layer;
-static TextLayer  *s_widget_layers[3];
 static char        s_widget_bufs[3][16];
 
 static int  s_clockstyle  = CLOCK_DOT;
 static int  s_widgets[3]  = {WIDGET_STEPS, WIDGET_BPM, WIDGET_BATTERY};
+static int  s_sunrise_min = 360;   /* default 6:00am */
+static int  s_sunset_min  = 1200;  /* default 8:00pm */
+
+/* Forward declaration */
+static const char *widget_label(int w);
 
 /* ================================================================ */
 /*  SKY COLOUR                                                       */
@@ -165,20 +174,89 @@ static uint8_t u8lerp(uint8_t a, uint8_t b, int t, int d) {
   return (uint8_t)(a + (int)(b - a) * t / d);
 }
 
+/* Sky colour using real sunrise/sunset times.
+ * Transition zones: 90min before/after sunrise and sunset. */
 static GColor sky_color(int hour, int min) {
-  int hm = hour * 60 + min;
-  if      (hm >= 600 && hm <= 960)  return GColorFromRGB(0xb4,0xc8,0xd4); /* day */
-  else if (hm > 420  && hm < 600) { int t=hm-420,d=180; return GColorFromRGB(u8lerp(0x0a,0xb4,t,d),u8lerp(0x0a,0xc8,t,d),u8lerp(0x1a,0xd4,t,d)); } /* dawn */
-  else if (hm > 960  && hm < 1140){ int t=hm-960,d=180; return GColorFromRGB(u8lerp(0xb4,0x1a,t,d),u8lerp(0xc8,0x08,t,d),u8lerp(0xd4,0x08,t,d)); } /* dusk */
-  else if (hm >= 1140&& hm < 1260){ int t=hm-1140,d=120;return GColorFromRGB(u8lerp(0x1a,0x02,t,d),u8lerp(0x08,0x02,t,d),u8lerp(0x08,0x05,t,d)); } /* late */
-  return GColorFromRGB(0x02,0x02,0x05); /* night */
+  int hm    = hour * 60 + min;
+  int rise  = s_sunrise_min;
+  int set   = s_sunset_min;
+  int trans = 90;  /* transition window in minutes */
+
+  /* Full day */
+  if (hm >= rise && hm <= set) {
+    /* Dawn transition */
+    if (hm < rise + trans) {
+      int t = hm - rise, d = trans;
+      return GColorFromRGB(u8lerp(0x4a,0xb4,t,d), u8lerp(0x2a,0xc8,t,d), u8lerp(0x1a,0xd4,t,d));
+    }
+    /* Dusk transition */
+    if (hm > set - trans) {
+      int t = hm - (set - trans), d = trans;
+      return GColorFromRGB(u8lerp(0xb4,0x4a,t,d), u8lerp(0xc8,0x18,t,d), u8lerp(0xd4,0x08,t,d));
+    }
+    return GColorFromRGB(0xb4, 0xc8, 0xd4);  /* midday */
+  }
+
+  /* Pre-dawn: up to 90min before sunrise */
+  if (hm >= rise - trans && hm < rise) {
+    int t = hm - (rise - trans), d = trans;
+    return GColorFromRGB(u8lerp(0x02,0x4a,t,d), u8lerp(0x02,0x2a,t,d), u8lerp(0x05,0x1a,t,d));
+  }
+
+  /* Post-dusk: up to 90min after sunset */
+  if (hm > set && hm <= set + trans) {
+    int t = hm - set, d = trans;
+    return GColorFromRGB(u8lerp(0x4a,0x02,t,d), u8lerp(0x18,0x02,t,d), u8lerp(0x08,0x05,t,d));
+  }
+
+  return GColorFromRGB(0x02, 0x02, 0x05);  /* night */
 }
 
-static bool is_daytime(int hour)  { return hour >= 7  && hour <= 18; }
-static bool is_nighttime(int hour){ return hour >  20 || hour < 5;   }
+static bool is_daytime(int hour, int min) {
+  int hm = hour * 60 + min;
+  return hm >= s_sunrise_min && hm <= s_sunset_min;
+}
 
-static GColor fg_color(int hour) {
-  return is_daytime(hour) ? GColorBlack : GColorWhite;
+static bool is_nighttime(int hour, int min) {
+  int hm = hour * 60 + min;
+  return hm < (s_sunrise_min - 90) || hm > (s_sunset_min + 90);
+}
+
+static GColor fg_color(int hour, int min) {
+  return is_daytime(hour, min) ? GColorBlack : GColorWhite;
+}
+
+/* ================================================================ */
+/*  WIDGET COLOUR — dynamic grey based on sky brightness            */
+/*  label: always mid-grey #555 readable on both light/dark         */
+/*  value: dark on day sky, light on night sky                      */
+/* ================================================================ */
+
+static void get_widget_colors(int hour, int min,
+                               GColor *out_label, GColor *out_value) {
+  int hm    = hour * 60 + min;
+  int rise  = s_sunrise_min;
+  int set   = s_sunset_min;
+  int trans = 90;
+
+  /* brightness: 0=full night, 256=full day */
+  int brightness = 0;
+  if (hm >= rise && hm <= set) {
+    if      (hm < rise + trans) brightness = (hm - rise) * 256 / trans;
+    else if (hm > set  - trans) brightness = (set - hm)  * 256 / trans;
+    else                        brightness = 256;
+  } else if (hm >= rise - trans && hm < rise) {
+    brightness = (hm - (rise - trans)) * 80 / trans;  /* partial pre-dawn */
+  } else if (hm > set && hm <= set + trans) {
+    brightness = (set + trans - hm) * 80 / trans;     /* partial post-dusk */
+  }
+
+  /* label: fixed mid-grey — readable on both sky tones */
+  *out_label = GColorFromRGB(0x77, 0x77, 0x77);
+
+  /* value: dark grey on bright sky, light grey on dark sky */
+  uint8_t v = (uint8_t)(0x33 + (0xcc - 0x33) * (256 - brightness) / 256);
+  *out_value = GColorFromRGB(v, v, v);
 }
 
 /* ================================================================ */
@@ -186,12 +264,14 @@ static GColor fg_color(int hour) {
 /* ================================================================ */
 
 static void arc_pos(int t_num, int t_den, int *ox, int *oy) {
+  /* Arc travels across the open sky portion above the scene (top 44px) */
+  int open_sky = SKY_H - (36 * SP);  /* 44px of open sky */
   *ox = 4 + (SCREEN_W - 8) * t_num / t_den;
-  int startY = SKY_H * 25 / 100;  /* 27px */
-  int peakY  = SKY_H *  8 / 100;  /*  9px */
+  int startY = open_sky * 80 / 100;  /* start/end at 80% of open sky = 35px */
+  int peakY  = open_sky * 15 / 100;  /* peak at 15% of open sky = 7px */
   int rise   = (startY - peakY) * 4 * t_num / t_den * (t_den - t_num) / t_den;
   *oy = startY - rise;
-  if (*oy < 8) *oy = 8;
+  if (*oy < 6) *oy = 6;
 }
 
 /* ================================================================ */
@@ -217,6 +297,11 @@ static void draw_sun(GContext *ctx, int cx, int cy, GColor col) {
 /* ================================================================ */
 
 static void draw_moon(GContext *ctx, int cx, int cy, int phase_num, int phase_den, GColor col) {
+  /* phase_num=0           → new moon (skip)
+     phase_num=phase_den/2 → full moon (all lit)
+     phase_num=phase_den-1 → waning crescent                    */
+  if (phase_num == 0) return;
+
   static const int8_t disc[][2] = {
     {-1,-3},{0,-3},{1,-3},
     {-2,-2},{-1,-2},{0,-2},{1,-2},{2,-2},
@@ -227,17 +312,25 @@ static void draw_moon(GContext *ctx, int cx, int cy, int phase_num, int phase_de
     {-1,3},{0,3},{1,3}
   };
   graphics_context_set_fill_color(ctx, col);
-  for (int i=0;i<37;i++) {
+  int half = phase_den / 2;
+  for (int i = 0; i < 37; i++) {
     int x = disc[i][0];
     bool lit;
-    if (phase_num * 2 <= phase_den) {
-      int term = (phase_num * 6 / phase_den) - 3;
-      lit = x >= term;
+    if (phase_num <= half) {
+      /* waxing: phase=1→ thin right crescent, phase=half→ full
+         terminator starts at +3 (right edge) moves to -3 (full) */
+      int term = 3 - (phase_num * 6 / half);  /* +3 down to -3 */
+      lit = (x >= term);
     } else {
-      int term = ((phase_num - phase_den/2) * 6 / phase_den) - 3;
-      lit = x <= term;
+      /* waning: phase=half+1→ full, phase=end-1→ thin left crescent
+         terminator starts at -3 (full) moves to +3 (nothing)     */
+      int rem  = phase_den - phase_num;
+      int term = (rem * 6 / half) - 3;         /* +3 down to -3 */
+      lit = (x <= term);
     }
-    if (lit) graphics_fill_rect(ctx,GRect(cx+x*SP,cy+disc[i][1]*SP,SP,SP),0,GCornerNone);
+    if (lit)
+      graphics_fill_rect(ctx,
+        GRect(cx + x*SP, cy + disc[i][1]*SP, SP, SP), 0, GCornerNone);
   }
 }
 
@@ -267,10 +360,17 @@ static void draw_stars(GContext *ctx, int seed) {
 /* ================================================================ */
 
 static void draw_tuscany(GContext *ctx, GColor col) {
-  int oy = SKY_H - 36 * SP;  /* scene base aligned to horizon */
+  /* Scene grid: 72w x 36h units, each unit = SP x SP pixels
+   * Total scene: 144 x 72px
+   * Positioned at bottom of sky: y = SKY_H - 72 = 36            */
+  int oy = SKY_H - (36 * SP);  /* = 108 - 72 = 36 */
   graphics_context_set_fill_color(ctx, col);
-  for (int i=0;i<TUSCANY_LEN;i++)
-    graphics_fill_rect(ctx, GRect(TUSCANY[i][0]*SP, oy+TUSCANY[i][1]*SP, SP, SP), 0, GCornerNone);
+  for (int i = 0; i < TUSCANY_LEN; i++) {
+    int px = TUSCANY[i][0] * SP;
+    int py = oy + TUSCANY[i][1] * SP;
+    if (px >= 0 && px < SCREEN_W && py >= 0 && py < SKY_H)
+      graphics_fill_rect(ctx, GRect(px, py, SP, SP), 0, GCornerNone);
+  }
 }
 
 /* ================================================================ */
@@ -282,43 +382,85 @@ static void canvas_update(Layer *layer, GContext *ctx) {
   struct tm *t = localtime(&now);
   int hour = t->tm_hour, min = t->tm_min;
   int hm   = hour * 60 + min;
-  bool night = is_nighttime(hour);
 
   GColor sky = sky_color(hour, min);
-  GColor fg  = fg_color(hour);
+  GColor fg  = fg_color(hour, min);
+  bool night = is_nighttime(hour, min);
+  (void)night;
 
-  /* Fill entire screen — strip uses same colour automatically */
+  /* Fill entire screen with sky colour — strip is seamless */
   graphics_context_set_fill_color(ctx, sky);
   graphics_fill_rect(ctx, GRect(0,0,SCREEN_W,SCREEN_H), 0, GCornerNone);
 
-  /* Stars at night */
-  if (night || hour < 6)
+  /* Stars — visible from sunset through sunrise */
+  if (hm >= s_sunset_min || hm <= s_sunrise_min)
     draw_stars(ctx, t->tm_yday);
 
-  /* Sun: 6:00–20:00 */
-  if (hm >= 360 && hm <= 1200) {
+  /* Sun arc: spans from sunrise to sunset */
+  if (hm >= s_sunrise_min && hm <= s_sunset_min) {
     int sx, sy;
-    arc_pos(hm - 360, 840, &sx, &sy);
+    int t_num = hm - s_sunrise_min;
+    int t_den = s_sunset_min - s_sunrise_min;
+    arc_pos(t_num, t_den, &sx, &sy);
     draw_sun(ctx, sx, sy, fg);
   }
 
-  /* Moon: 20:00–6:00 (opposite arc, right→left) */
+  /* Moon arc: spans from sunset → midnight → sunrise
+   * moon_len = full night duration in minutes             */
   {
+    int day_len  = s_sunset_min - s_sunrise_min;
+    int moon_len = 1440 - day_len;  /* total night minutes */
     int m_num = -1;
-    if      (hm >= 1200) m_num = hm - 1200;
-    else if (hm <= 360)  m_num = hm + 240;   /* 0–6am: offset by 240 */
-    int m_den = 600;
-    if (m_num >= 0 && m_num <= m_den) {
+
+    if (hm >= s_sunset_min) {
+      /* Evening side: just after sunset */
+      m_num = hm - s_sunset_min;
+    } else if (hm <= s_sunrise_min) {
+      /* Morning side: before sunrise, wrap around midnight */
+      m_num = (1440 - s_sunset_min) + hm;
+    }
+
+    if (m_num >= 0 && m_num <= moon_len) {
       int mx, my;
-      arc_pos(m_den - m_num, m_den, &mx, &my);  /* reversed */
-      int phase = t->tm_yday % 30;
-      GColor mc = night ? GColorLightGray : GColorDarkGray;
-      draw_moon(ctx, mx, my, phase, 30, mc);
+      arc_pos(moon_len - m_num, moon_len, &mx, &my);
+      int phase = t->tm_yday % 29;  /* 29-day lunar cycle */
+      draw_moon(ctx, mx, my, phase, 29, GColorWhite);
     }
   }
 
   /* Tuscany scene */
   draw_tuscany(ctx, fg);
+
+  /* ---- HEALTH WIDGETS — drawn on canvas with dynamic colour ---- */
+  {
+    GColor label_col, value_col;
+    get_widget_colors(hour, min, &label_col, &value_col);
+
+    GFont label_font = fonts_get_system_font(FONT_KEY_GOTHIC_09);
+    GFont value_font = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+
+    for (int i = 0; i < 3; i++) {
+      int wy = STRIP_Y + 3 + i * 18;
+
+      /* Label — tiny, mid-grey */
+      graphics_context_set_text_color(ctx, label_col);
+      graphics_draw_text(ctx, widget_label(s_widgets[i]),
+        label_font,
+        GRect(WIDGET_X, wy + 2, 23, 10),
+        GTextOverflowModeWordWrap, GTextAlignmentLeft, NULL);
+
+      /* Value — bold, dynamic contrast grey */
+      /* Extract value part from buf (after the space) */
+      const char *buf = s_widget_bufs[i];
+      while (*buf && *buf != ' ') buf++;
+      if (*buf == ' ') buf++;
+      graphics_context_set_text_color(ctx, value_col);
+      graphics_draw_text(ctx, buf,
+        value_font,
+        GRect(WIDGET_X + 24, wy - 1, 60, 17),
+        GTextOverflowModeWordWrap, GTextAlignmentLeft, NULL);
+    }
+  }
 }
 
 /* ================================================================ */
@@ -450,7 +592,7 @@ static void update_widget(int slot) {
       break; }
   }
   snprintf(s_widget_bufs[slot],sizeof(s_widget_bufs[slot]),"%s %s",widget_label(s_widgets[slot]),val);
-  text_layer_set_text(s_widget_layers[slot], s_widget_bufs[slot]);
+  if (s_canvas_layer) layer_mark_dirty(s_canvas_layer);
 }
 
 static void update_all_widgets(void) {
@@ -475,13 +617,27 @@ static void battery_handler(BatteryChargeState state) { update_widget(2); }
 
 static void inbox_received(DictionaryIterator *iter, void *context) {
   Tuple *tp;
+
   tp = dict_find(iter, MSG_CLOCKSTYLE);
   if (tp) {
     int v = (int)tp->value->int32;
     if (v>=0&&v<=2) { s_clockstyle=v; persist_write_int(PERSIST_CLOCKSTYLE,v); layer_mark_dirty(s_clock_layer); }
   }
-  int keys[3] = {MSG_WIDGET0,MSG_WIDGET1,MSG_WIDGET2};
-  int pkeys[3]= {PERSIST_WIDGET0,PERSIST_WIDGET1,PERSIST_WIDGET2};
+
+  tp = dict_find(iter, MSG_SUNRISE);
+  if (tp) {
+    int v = (int)tp->value->int32;
+    if (v>=0&&v<1440) { s_sunrise_min=v; persist_write_int(PERSIST_SUNRISE,v); layer_mark_dirty(s_canvas_layer); }
+  }
+
+  tp = dict_find(iter, MSG_SUNSET);
+  if (tp) {
+    int v = (int)tp->value->int32;
+    if (v>0&&v<1440) { s_sunset_min=v; persist_write_int(PERSIST_SUNSET,v); layer_mark_dirty(s_canvas_layer); }
+  }
+
+  int keys[3]  = {MSG_WIDGET0, MSG_WIDGET1, MSG_WIDGET2};
+  int pkeys[3] = {PERSIST_WIDGET0, PERSIST_WIDGET1, PERSIST_WIDGET2};
   for (int i=0;i<3;i++) {
     tp = dict_find(iter, keys[i]);
     if (tp) {
@@ -502,15 +658,6 @@ static void window_load(Window *window) {
   layer_set_update_proc(s_canvas_layer, canvas_update);
   layer_add_child(root, s_canvas_layer);
 
-  GFont wfont = fonts_get_system_font(FONT_KEY_GOTHIC_14);
-  for (int i=0;i<3;i++) {
-    s_widget_layers[i] = text_layer_create(GRect(WIDGET_X, WIDGET_Y+i*17, 80, 18));
-    text_layer_set_background_color(s_widget_layers[i], GColorClear);
-    text_layer_set_text_color(s_widget_layers[i], GColorLightGray);
-    text_layer_set_font(s_widget_layers[i], wfont);
-    layer_add_child(root, text_layer_get_layer(s_widget_layers[i]));
-  }
-
   s_clock_layer = layer_create(GRect(CLOCK_X,CLOCK_Y,CLOCK_SIZE,CLOCK_SIZE));
   layer_set_update_proc(s_clock_layer, clock_layer_update);
   layer_add_child(root, s_clock_layer);
@@ -521,7 +668,6 @@ static void window_load(Window *window) {
 static void window_unload(Window *window) {
   layer_destroy(s_canvas_layer);
   layer_destroy(s_clock_layer);
-  for (int i=0;i<3;i++) text_layer_destroy(s_widget_layers[i]);
 }
 
 /* ================================================================ */
@@ -529,12 +675,18 @@ static void window_unload(Window *window) {
 /* ================================================================ */
 
 static void init(void) {
-  s_clockstyle = persist_exists(PERSIST_CLOCKSTYLE) ? persist_read_int(PERSIST_CLOCKSTYLE) : CLOCK_DOT;
-  s_widgets[0] = persist_exists(PERSIST_WIDGET0)    ? persist_read_int(PERSIST_WIDGET0)    : WIDGET_STEPS;
-  s_widgets[1] = persist_exists(PERSIST_WIDGET1)    ? persist_read_int(PERSIST_WIDGET1)    : WIDGET_BPM;
-  s_widgets[2] = persist_exists(PERSIST_WIDGET2)    ? persist_read_int(PERSIST_WIDGET2)    : WIDGET_BATTERY;
-  if (s_clockstyle<0||s_clockstyle>2) s_clockstyle=CLOCK_DOT;
+  s_clockstyle  = persist_exists(PERSIST_CLOCKSTYLE) ? persist_read_int(PERSIST_CLOCKSTYLE) : CLOCK_DOT;
+  s_widgets[0]  = persist_exists(PERSIST_WIDGET0)    ? persist_read_int(PERSIST_WIDGET0)    : WIDGET_STEPS;
+  s_widgets[1]  = persist_exists(PERSIST_WIDGET1)    ? persist_read_int(PERSIST_WIDGET1)    : WIDGET_BPM;
+  s_widgets[2]  = persist_exists(PERSIST_WIDGET2)    ? persist_read_int(PERSIST_WIDGET2)    : WIDGET_BATTERY;
+  s_sunrise_min = persist_exists(PERSIST_SUNRISE)    ? persist_read_int(PERSIST_SUNRISE)    : 360;
+  s_sunset_min  = persist_exists(PERSIST_SUNSET)     ? persist_read_int(PERSIST_SUNSET)     : 1200;
+
+  if (s_clockstyle<0||s_clockstyle>2)         s_clockstyle=CLOCK_DOT;
   for (int i=0;i<3;i++) if (s_widgets[i]<0||s_widgets[i]>4) s_widgets[i]=i;
+  if (s_sunrise_min<0||s_sunrise_min>=1440)   s_sunrise_min=360;
+  if (s_sunset_min<=0||s_sunset_min>=1440)    s_sunset_min=1200;
+  if (s_sunset_min<=s_sunrise_min)            s_sunset_min=s_sunrise_min+720;
 
   s_window = window_create();
   window_set_background_color(s_window, GColorBlack);
@@ -543,8 +695,9 @@ static void init(void) {
 
   tick_timer_service_subscribe(MINUTE_UNIT, tick_handler);
   battery_state_service_subscribe(battery_handler);
+  /* IMPORTANT: register inbox BEFORE calling app_message_open */
   app_message_register_inbox_received(inbox_received);
-  app_message_open(128, 64);
+  app_message_open(512, 128);  /* 512 in, 128 out — fits 6 int32 keys comfortably */
 }
 
 static void deinit(void) {
